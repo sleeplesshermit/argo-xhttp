@@ -176,10 +176,43 @@ const keyPath = path.join(FILE_PATH, "private.key");
 const isArm = ["arm", "arm64", "aarch64"].includes(os.arch());
 const XRAY_VER = "25.1.30";
 const SINGBOX_VER = "1.11.4";
+const CLOUDFLARED_VER = "2026.10.7";
 
 const singboxUrl = `https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${isArm ? "arm64" : "amd64"}.tar.gz`;
 const xrayZipUrl = `https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/Xray-linux-${isArm ? "arm64-v8a" : "64"}.zip`;
-const cloudflaredUrl = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${isArm ? "arm64" : "amd64"}`;
+const cloudflaredUrl = `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VER}/cloudflared-linux-${isArm ? "arm64" : "amd64"}`;
+
+// 下载文件 SHA-256 校验表：cloudflared 取自 GitHub 发布资产 digest 字段，Xray 取自官方 .dgst 文件；
+// sing-box v1.11.4 官方未提供 SHA-256 摘要（digest 字段为空且无校验文件），仅固定版本，不做摘要校验
+const SHA256_MAP = {
+  cloudflared: {
+    amd64: "1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872",
+    arm64: "3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775"
+  },
+  xray: {
+    amd64: "20db837e3c33cce9a804c7d991b722a7cbd37bad4b7fc6200457f0b1c63084f2",
+    arm64: "5f1b3a4b0155c2d6e710ab3e7eca64f3d3226be0295c188e8085b96835490d1d"
+  }
+};
+const ARCH_KEY = isArm ? "arm64" : "amd64";
+
+// 校验下载文件的 SHA-256（流式读取，避免大文件占内存）；无官方摘要时跳过
+function verifySha256(filePath, expected) {
+  if (!expected) return;
+  const hash = crypto.createHash("sha256");
+  const fd = fs.openSync(filePath, "r");
+  const buf = Buffer.alloc(1024 * 1024);
+  let bytesRead;
+  while ((bytesRead = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+    hash.update(buf.subarray(0, bytesRead));
+  }
+  fs.closeSync(fd);
+  if (hash.digest("hex") !== expected) {
+    throw new Error(`SHA-256 校验失败: ${path.basename(filePath)} 与官方摘要不匹配，已中止`);
+  }
+  log(`[校验] ${path.basename(filePath)} SHA-256 校验通过`);
+}
+
 
 let singboxProc = null;
 let webProc = null;
@@ -226,6 +259,12 @@ async function startSingBox() {
       detached: true
     });
 
+    // 转发子进程 stderr 到主日志，避免管道无人读取导致子进程阻塞
+    if (singboxProc.stderr) {
+      const rlSingbox = readline.createInterface({ input: singboxProc.stderr });
+      rlSingbox.on("line", (line) => log(`[Sing-box] ${line}`));
+    }
+
     singboxProc.on("exit", (code) => {
       if (isExiting) return;
       log(`[警告] Sing-box 意外退出 (code: ${code})，3秒后自动拉起...`);
@@ -245,6 +284,7 @@ async function startXray() {
       log("正在下载 Xray-core...");
       const tempZip = path.join(FILE_PATH, "xray.zip");
       await downloadFile(xrayZipUrl, tempZip);
+      verifySha256(tempZip, SHA256_MAP.xray[ARCH_KEY]);
       const extractScriptPath = path.join(FILE_PATH, "extract.py");
       const pyCode = `
 import zipfile, sys
@@ -290,6 +330,12 @@ except Exception as e:
       detached: true
     });
 
+    // 转发子进程 stderr 到主日志，避免管道无人读取导致子进程阻塞
+    if (webProc.stderr) {
+      const rlXray = readline.createInterface({ input: webProc.stderr });
+      rlXray.on("line", (line) => log(`[Xray] ${line}`));
+    }
+
     webProc.on("exit", (code) => {
       if (isExiting) return;
       log(`[警告] Xray 意外退出 (code: ${code})，3秒后自动拉起...`);
@@ -308,6 +354,7 @@ async function startCloudflared(argoArgs) {
     if (!fs.existsSync(botPath)) {
       log("正在下载 Cloudflared...");
       await downloadFile(cloudflaredUrl, botPath);
+      verifySha256(botPath, SHA256_MAP.cloudflared[ARCH_KEY]);
     }
     fs.chmodSync(botPath, 0o775);
 
